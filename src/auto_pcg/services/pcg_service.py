@@ -1,0 +1,244 @@
+"""High-Level-Service, der Scanner, KI und PCG-Builder orchestriert."""
+
+from __future__ import annotations
+
+import os
+import logging
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence
+
+from auto_pcg.ai.llm_manager import LLMManager
+from auto_pcg.ai.prompt_engine import PromptEngine
+from auto_pcg.core.asset_analyzer import AssetAnalyzer
+from auto_pcg.core.asset_scanner import AssetScanner
+from auto_pcg.data.asset_database import AssetDatabase
+from auto_pcg.models.schemas import AssetData, Classification, PCGGraph, PCGPlan
+from auto_pcg.pcg.graph_builder import PCGBuilder
+from auto_pcg.pcg.unreal_exporter import UnrealPCGExporter
+from auto_pcg.pcg.ue_integration import run_unreal_import
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class AutoPCGService:
+    """Öffnet eine einfache Python-API für das Auto-PCG-System."""
+
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        max_assets: Optional[int] = None,
+        prefer_heuristics: bool = False,
+        classification_batch_size: Optional[int] = None,
+        ollama_url: Optional[str] = None,
+        ollama_model: Optional[str] = None,
+        ollama_timeout: Optional[float] = None,
+        use_local_model: bool = True,
+        export_directory: Optional[Path] = None,
+        ue_editor: Optional[Path] = None,
+        ue_map: Optional[str] = None,
+        ue_asset_folder: str = "/Game/AutoPCG",
+        ue_spawn: bool = True,
+    ) -> None:
+        self.database = AssetDatabase()
+        self._has_scanned = False
+        self._max_assets = max_assets
+        self._prefer_heuristics = prefer_heuristics
+        self._project_root = Path(project_root)
+        self._export_directory = export_directory
+        self._ue_editor = Path(ue_editor) if ue_editor else None
+        self._ue_map = ue_map
+        self._ue_asset_folder = ue_asset_folder
+        self._ue_spawn = ue_spawn
+        self._ue_script = Path(__file__).resolve().parents[1] / "scripts" / "ue_pcg_import.py"
+        self.cache_path = self._resolve_cache_path(project_root)
+        if self.cache_path and self.cache_path.exists():
+            try:
+                self.database.load_from_json(self.cache_path)
+                LOGGER.info("Geladene Asset-Datenbank: %s", self.cache_path)
+            except Exception as exc:  # pragma: no cover - Dateifehler
+                LOGGER.warning("Konnte Asset-Cache nicht laden (%s): %s", self.cache_path, exc)
+        self.scanner = AssetScanner(project_root, self.database)
+        self.analyzer = AssetAnalyzer()
+        self.prompt_engine = PromptEngine()
+        self.llm_manager = LLMManager(
+            prompt_engine=self.prompt_engine,
+            local_model_path=self._resolve_local_model_path() if use_local_model else None,
+            classification_batch_size=classification_batch_size,
+            base_url=ollama_url or "http://localhost:11434",
+            model=ollama_model or "llama3",
+            timeout=ollama_timeout or 10.0,
+        )
+        self.graph_builder = PCGBuilder()
+        self._exporter = (
+            UnrealPCGExporter(self._export_directory) if self._export_directory else None
+        )
+        self._uproject_path = self._find_uproject(self._project_root)
+        if not self.llm_manager._local_client:
+            self.llm_manager.setup_ollama_connection()
+
+    def scan_and_classify_assets(self) -> List[AssetData]:
+        """Führt den Asset-Scan durch und klassifiziert jedes Asset."""
+        assets = self.scanner.scan_project_assets(limit=self._max_assets)
+        if self._max_assets is not None:
+            LOGGER.info(
+                "Asset-Scan auf maximal %s Dateien begrenzt (gefunden: %s).",
+                self._max_assets,
+                len(assets),
+            )
+        assets_to_classify: List[AssetData] = []
+        for asset in assets:
+            cached = self.database.get_asset(asset.asset_id)
+            if cached and cached.semantic_tags:
+                asset.semantic_tags = cached.semantic_tags
+                asset.semantic_profile = cached.semantic_profile
+                self.database.store_asset(asset)
+            else:
+                assets_to_classify.append(asset)
+
+        if assets_to_classify:
+            if self._prefer_heuristics:
+                LOGGER.info(
+                    "Überspringe LLM-Klassifikation und nutze heuristischen Schnellmodus (%s Assets).",
+                    len(assets_to_classify),
+                )
+                for asset in assets_to_classify:
+                    classification = self.analyzer.classify_asset_semantics(asset)
+                    self._apply_classification(asset, classification)
+                    self.database.store_asset(asset)
+            else:
+                classifications = self.llm_manager.send_classification_request(assets_to_classify)
+                by_path = {
+                    classification.asset_path.resolve(): classification
+                    for classification in classifications
+                }
+                for asset in assets_to_classify:
+                    classification = by_path.get(asset.asset_path.resolve())
+                    if classification:
+                        self._apply_classification(asset, classification)
+                    self.database.store_asset(asset)
+
+        self._persist_database()
+        self._has_scanned = True
+        return assets
+
+    def generate_pcg_plan(self, user_prompt: str, asset_subset: Sequence[AssetData] | None = None) -> PCGPlan:
+        """Erstellt einen PCG-Plan für den angegebenen Textbefehl."""
+        if not self._has_scanned:
+            LOGGER.info("Starte automatischen Asset-Scan vor der Planerstellung.")
+            self.scan_and_classify_assets()
+        context_assets = list(asset_subset or self._choose_context_assets(user_prompt))
+        if not context_assets:
+            context_assets = list(self.database.all_assets())
+        return self.llm_manager.send_pcg_generation_request(user_prompt, context_assets)
+
+    def build_graph_for_prompt(self, user_prompt: str) -> PCGGraph:
+        """Kompletter Workflow von Text zu PCG-Graph."""
+        if not self._has_scanned:
+            LOGGER.info("Assets wurden noch nicht gescannt – führe Scan jetzt aus.")
+            self.scan_and_classify_assets()
+        plan = self.generate_pcg_plan(user_prompt)
+        graph = self.graph_builder.create_pcg_graph_from_plan(plan)
+        export_path = None
+        if self._exporter:
+            export_path = self._exporter.export(graph)
+            LOGGER.info("PCG-Graph nach %s exportiert.", export_path)
+        if self._ue_editor and export_path:
+            self._trigger_unreal_import(export_path)
+        return graph
+
+    # Private Hilfen ----------------------------------------------------------------------------
+
+    def _choose_context_assets(self, user_prompt: str) -> Iterable[AssetData]:
+        """Nutzt einfache Keyword-Extraktion, um relevante Assets zu finden."""
+        keywords = [
+            token.lower()
+            for token in user_prompt.replace(",", " ").split()
+            if len(token) > 3
+        ]
+        if not keywords:
+            return self.database.all_assets()
+        recommendations = self.database.get_asset_recommendations(keywords, limit=5)
+        if recommendations:
+            return recommendations
+        return self.database.all_assets()
+
+    def _resolve_local_model_path(self) -> Optional[Path]:
+        """Sucht nach einem GGUF-Modell im Projekt oder über Umgebungsvariable."""
+        env_path = os.getenv("AUTO_PCG_GGUF_MODEL")
+        if env_path:
+            candidate = Path(env_path).expanduser()
+            if candidate.exists():
+                return candidate
+        module_path = Path(__file__).resolve()
+        repo_root = module_path.parent
+        try:
+            repo_root = module_path.parents[3]
+        except IndexError:
+            repo_root = module_path.parent
+        search_roots = [
+            Path.cwd(),
+            repo_root,
+        ]
+        for root in search_roots:
+            for match in root.glob("*.gguf"):
+                return match
+        return None
+
+    def _resolve_cache_path(self, project_root: Path) -> Optional[Path]:
+        """Bestimmt, wo die Asset-Datenbank zwischengespeichert wird."""
+        env_cache = os.getenv("AUTO_PCG_CACHE")
+        if env_cache:
+            return Path(env_cache).expanduser()
+        try:
+            project_root = Path(project_root).resolve()
+        except OSError:
+            project_root = Path.cwd()
+        return project_root / ".auto_pcg_assets.json"
+
+    def _persist_database(self) -> None:
+        """Schreibt die aktuelle Datenbank auf die Platte."""
+        if not self.cache_path:
+            return
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self.database.save_to_file(self.cache_path)
+        except Exception as exc:  # pragma: no cover - Dateifehler
+            LOGGER.warning("Konnte Asset-Cache nicht speichern (%s): %s", self.cache_path, exc)
+
+    def _apply_classification(self, asset: AssetData, classification: Classification) -> None:
+        """Aktualisiert ein Asset anhand einer Klassifikation."""
+        asset.semantic_tags = classification.tags
+        asset.semantic_profile = classification.to_profile()
+
+    def _find_uproject(self, start_path: Path) -> Optional[Path]:
+        """Sucht im angegebenen Pfad und darüber nach einer .uproject Datei."""
+        current = start_path
+        for _ in range(4):
+            matches = list(current.glob("*.uproject"))
+            if matches:
+                return matches[0]
+            if current.parent == current:
+                break
+            current = current.parent
+        LOGGER.warning("Keine .uproject Datei im Pfad %s gefunden.", start_path)
+        return None
+
+    def _trigger_unreal_import(self, json_path: Path) -> None:
+        if not self._ue_editor or not self._uproject_path:
+            LOGGER.warning("UE-Editor oder .uproject Pfad nicht gesetzt – Import wird übersprungen.")
+            return
+        try:
+            run_unreal_import(
+                editor_exe=self._ue_editor,
+                uproject=self._uproject_path,
+                graph_path=json_path,
+                script_path=self._ue_script,
+                asset_folder=self._ue_asset_folder,
+                asset_name=json_path.stem,
+                map_path=self._ue_map,
+                spawn=self._ue_spawn,
+            )
+        except Exception as exc:
+            LOGGER.warning("Unreal-Import fehlgeschlagen: %s", exc)
