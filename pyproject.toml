@@ -5,12 +5,14 @@ description = "Auto-PCG KI-Assistent f?r Unreal Engine 5.4"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.32.3",
-    "llama-cpp-python>=0.2.84"
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0"
+]
+llm = [
+    "llama-cpp-python>=0.2.84"
 ]
 
 [build-system]
