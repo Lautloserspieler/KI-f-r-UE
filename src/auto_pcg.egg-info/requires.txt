@@ -1,5 +1,7 @@
 requests>=2.32.3
-llama-cpp-python>=0.2.84
 
 [dev]
 pytest>=8.0
+
+[llm]
+llama-cpp-python>=0.2.84

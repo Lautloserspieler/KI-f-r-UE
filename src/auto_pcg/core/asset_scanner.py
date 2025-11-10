@@ -8,12 +8,14 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, TYPE_CHECKING
+from typing import Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 from auto_pcg.models.schemas import AssetData, AssetMetadata
+from auto_pcg.models.spatial import Vector3
 
 if TYPE_CHECKING:  # pragma: no cover - nur für Typprüfungen relevant
     from auto_pcg.data.asset_database import AssetDatabase
+    from auto_pcg.data.spatial_database import SpatialAssetDatabase
 
 
 LOGGER = logging.getLogger(__name__)
@@ -37,9 +39,18 @@ class AssetScanner:
         ".mtl": "Material",
     }
 
-    def __init__(self, project_root: Path, database: Optional["AssetDatabase"] = None) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        database: Optional["AssetDatabase"] = None,
+        *,
+        position_resolver: Optional[Callable[[Path], Optional[Vector3]]] = None,
+        lod_resolver: Optional[Callable[[Path], int]] = None,
+    ) -> None:
         self.project_root = Path(project_root)
         self.database = database
+        self._position_resolver = position_resolver
+        self._lod_resolver = lod_resolver
 
     def scan_project_assets(self, limit: Optional[int] = None) -> List[AssetData]:
         """Durchläuft das Projektverzeichnis und liefert alle gefundenen Assets.
@@ -131,9 +142,25 @@ class AssetScanner:
             LOGGER.warning("Konnte Metadaten für %s nicht lesen: %s", asset_path, exc)
             return None
         asset_type = self.SUPPORTED_EXTENSIONS.get(asset_path.suffix.lower(), "Unknown")
-        return AssetData(
+        asset = AssetData(
             asset_id=self._build_asset_id(asset_path),
             asset_path=asset_path,
             asset_type=asset_type,
             metadata=metadata,
         )
+        self._register_spatial_metadata(asset)
+        return asset
+
+    def _register_spatial_metadata(self, asset: AssetData) -> None:
+        if not self.database or not hasattr(self.database, "register_asset_position"):
+            return
+        if not self._position_resolver:
+            return
+        position = self._position_resolver(asset.asset_path)
+        if not position:
+            return
+        lod = 0
+        if self._lod_resolver:
+            lod = self._lod_resolver(asset.asset_path)
+        spatial_db: "SpatialAssetDatabase" = self.database  # type: ignore[assignment]
+        spatial_db.register_asset_position(asset.asset_id, position, lod_level=lod)

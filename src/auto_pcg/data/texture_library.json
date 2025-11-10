@@ -1,0 +1,28 @@
+{
+  "forest": {
+    "albedo": "/Game/AutoPCG/Materials/T_ForestGround_Albedo",
+    "normal": "/Game/AutoPCG/Materials/T_ForestGround_Normal",
+    "roughness": "/Game/AutoPCG/Materials/T_ForestGround_Roughness",
+    "ao": "/Game/AutoPCG/Materials/T_ForestGround_AO"
+  },
+  "mountain": {
+    "albedo": "/Game/AutoPCG/Materials/T_MountainRock_Albedo",
+    "normal": "/Game/AutoPCG/Materials/T_MountainRock_Normal",
+    "roughness": "/Game/AutoPCG/Materials/T_MountainRock_Roughness"
+  },
+  "desert": {
+    "albedo": "/Game/AutoPCG/Materials/T_DesertSand_Albedo",
+    "normal": "/Game/AutoPCG/Materials/T_DesertSand_Normal",
+    "roughness": "/Game/AutoPCG/Materials/T_DesertSand_Roughness"
+  },
+  "tundra": {
+    "albedo": "/Game/AutoPCG/Materials/T_TundraSnow_Albedo",
+    "normal": "/Game/AutoPCG/Materials/T_TundraSnow_Normal",
+    "roughness": "/Game/AutoPCG/Materials/T_TundraSnow_Roughness"
+  },
+  "swamp": {
+    "albedo": "/Game/AutoPCG/Materials/T_SwampMud_Albedo",
+    "normal": "/Game/AutoPCG/Materials/T_SwampMud_Normal",
+    "roughness": "/Game/AutoPCG/Materials/T_SwampMud_Roughness"
+  }
+}

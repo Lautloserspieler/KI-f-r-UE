@@ -13,6 +13,7 @@ import requests
 
 from auto_pcg.core.asset_analyzer import AssetAnalyzer
 from auto_pcg.models.schemas import AssetData, Classification, PCGFilterSpec, PCGLayer, PCGPlan
+from auto_pcg.models.terrain import HeightmapAnalysisResult, LandscapeLayerPlan, MaterialBlueprint
 
 from .local_llm import LocalGGUFClient, LocalLLMError, _auto_close_json, _extract_json_block
 from .prompt_engine import PromptEngine
@@ -91,7 +92,14 @@ class LLMManager:
                 results.extend(self._analyzer.classify_asset_semantics(asset) for asset in batch)
         return results
 
-    def send_pcg_generation_request(self, user_prompt: str, assets: Sequence[AssetData]) -> PCGPlan:
+    def send_pcg_generation_request(
+        self,
+        user_prompt: str,
+        assets: Sequence[AssetData],
+        *,
+        world_size: float | None = None,
+        season: str | None = None,
+    ) -> PCGPlan:
         """Generiert einen PCG-Plan über das LLM oder liefert einen simplen Fallback."""
         context_assets = assets[: self.PCG_CONTEXT_LIMIT]
         if len(assets) > self.PCG_CONTEXT_LIMIT:
@@ -100,7 +108,12 @@ class LLMManager:
                 len(assets),
                 self.PCG_CONTEXT_LIMIT,
             )
-        prompt = self.prompt_engine.build_pcg_generation_prompt(user_prompt, context_assets)
+        prompt = self.prompt_engine.build_pcg_generation_prompt(
+            user_prompt,
+            context_assets,
+            world_size=world_size,
+            season=season,
+        )
         LOGGER.info("LLM-PCG-Anfrage gestartet (Prompt: %s , Assets: %s).", user_prompt, len(context_assets))
         start = time.perf_counter()
         plan = self._parse_pcg_plan(self._run_prompt(prompt), context_assets)
@@ -109,6 +122,48 @@ class LLMManager:
             return plan
         LOGGER.info("Nutze lokalen PCG-Fallback.")
         return self._fallback_pcg_plan(user_prompt, assets)
+
+    # Terrain-Workflows ----------------------------------------------------------------------
+
+    def plan_heightmap_strategy(
+        self,
+        analysis: HeightmapAnalysisResult,
+    ) -> Optional[Dict[str, object]]:
+        """Fragt das LLM nach Optimierungen für Heightmap/Biome."""
+        prompt = self.prompt_engine.build_heightmap_strategy_prompt(analysis)
+        payload = self._run_prompt(prompt)
+        if not payload:
+            return None
+        strategy = payload.get("heightmap_strategy") if isinstance(payload, dict) else None
+        if not isinstance(strategy, dict):
+            return None
+        return strategy
+
+    def plan_material_blueprint(
+        self,
+        analysis: HeightmapAnalysisResult,
+        blueprint: MaterialBlueprint,
+    ) -> Optional[Dict[str, object]]:
+        """Lässt das LLM Material-Layer Vorschläge liefern."""
+        prompt = self.prompt_engine.build_material_blueprint_prompt(analysis, blueprint)
+        payload = self._run_prompt(prompt)
+        if not payload:
+            return None
+        result = payload.get("material_blueprint") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            return None
+        return result
+
+    def plan_layer_paint(self, plan: LandscapeLayerPlan) -> Optional[Dict[str, object]]:
+        """Fragt das LLM nach Layer-Mask-Optimierungen."""
+        prompt = self.prompt_engine.build_layer_paint_prompt(plan)
+        payload = self._run_prompt(prompt)
+        if not payload:
+            return None
+        result = payload.get("layer_plan") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            return None
+        return result
 
     def validate_llm_response(self, response: Dict[str, object]) -> bool:
         """Stellt sicher, dass Kernfelder vorhanden sind."""
